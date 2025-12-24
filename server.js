@@ -1,6 +1,6 @@
-// File: src/server.js (COMPLETE - Fixed date handling, removed legacy expiry, ready to run)
+// File: src/server.js (COMPLETE - PostgreSQL ready, legacy expiry removed, Aziman branding)
 const express = require('express');
-const mysql = require('mysql2/promise');
+const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
@@ -17,27 +17,24 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 app.use(cors({
-  origin: 'http://localhost:3000',
+  origin: process.env.NODE_ENV === 'production' 
+    ? ['https://your-frontend.onrender.com'] 
+    : 'http://localhost:3000',
   credentials: true
 }));
 
-// MySQL Connection Pool
-const db = mysql.createPool({
-  host: process.env.DB_HOST,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASS,
-  database: process.env.DB_NAME,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+// PostgreSQL Connection (Render uses DATABASE_URL)
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
 });
 
 (async () => {
   try {
-    await db.getConnection();
-    console.log('✅ MySQL Connected Successfully');
+    await db.connect();
+    console.log('✅ PostgreSQL Connected Successfully');
   } catch (err) {
-    console.error('❌ MySQL Connection Failed:', err);
+    console.error('❌ PostgreSQL Connection Failed:', err);
     process.exit(1);
   }
 })();
@@ -73,10 +70,10 @@ app.post('/login', [
 
   const { username, password } = req.body;
   try {
-    const [results] = await db.query('SELECT * FROM users WHERE username = ?', [username]);
-    if (results.length === 0) return res.status(400).json({ msg: 'Invalid credentials' });
+    const result = await db.query('SELECT * FROM users WHERE username = $1', [username]);
+    if (result.rows.length === 0) return res.status(400).json({ msg: 'Invalid credentials' });
 
-    const user = results[0];
+    const user = result.rows[0];
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ msg: 'Invalid credentials' });
 
@@ -98,14 +95,14 @@ app.post('/change-password', auth, [
 
   const { currentPassword, newPassword } = req.body;
   try {
-    const [results] = await db.query('SELECT password FROM users WHERE id = ?', [req.user.id]);
-    if (results.length === 0) return res.status(400).json({ msg: 'User not found' });
+    const result = await db.query('SELECT password FROM users WHERE id = $1', [req.user.id]);
+    if (result.rows.length === 0) return res.status(400).json({ msg: 'User not found' });
 
-    const isMatch = await bcrypt.compare(currentPassword, results[0].password);
+    const isMatch = await bcrypt.compare(currentPassword, result.rows[0].password);
     if (!isMatch) return res.status(400).json({ msg: 'Current password incorrect' });
 
     const hashed = await bcrypt.hash(newPassword, 10);
-    await db.query('UPDATE users SET password = ? WHERE id = ?', [hashed, req.user.id]);
+    await db.query('UPDATE users SET password = $1 WHERE id = $2', [hashed, req.user.id]);
     res.json({ msg: 'Password updated successfully' });
   } catch (err) {
     console.error('CHANGE PASSWORD ERROR:', err);
@@ -121,18 +118,18 @@ app.get('/items', auth, async (req, res) => {
       id, item_name, type, subtype, category, serial, firmware, estimating_costing,
       for_by, pic, pic_contact, pic_email,
       last_renewal_date, next_due_date, reminder_type
-    FROM items 
+    FROM items
   `;
   const params = [];
   if (type) {
-    query += ' WHERE reminder_type = ?';
+    query += ' WHERE reminder_type = $1';
     params.push(type);
   }
   query += ' ORDER BY next_due_date ASC';
 
   try {
-    const [results] = await db.query(query, params);
-    const items = results.map(calculateDerivedFields);
+    const result = await db.query(query, params);
+    const items = result.rows.map(calculateDerivedFields);
     res.json(items);
   } catch (err) {
     console.error('GET ITEMS ERROR:', err);
@@ -165,14 +162,21 @@ app.post('/items', [auth, adminOnly], [
     pic_contact: item.pic_contact || '',
     pic_email: item.pic_email || '',
     last_renewal_date: today,
-    next_due_date: item.next_due_date,  // ← Use user-provided date directly
+    next_due_date: item.next_due_date,
     reminder_type: item.reminder_type
   };
 
   try {
-    const [result] = await db.query('INSERT INTO items SET ?', newItem);
-    console.log('✅ Created item ID:', result.insertId);
-    res.json({ id: result.insertId, msg: 'Item created successfully!' });
+    const keys = Object.keys(newItem);
+    const values = Object.values(newItem);
+    const placeholders = keys.map((_, i) => `$${i+1}`).join(', ');
+    const queryText = `INSERT INTO items (${keys.join(', ')}) VALUES (${placeholders}) RETURNING id`;
+
+    const result = await db.query(queryText, values);
+    const insertId = result.rows[0].id;
+
+    console.log('✅ Created item ID:', insertId);
+    res.json({ id: insertId, msg: 'Item created successfully!' });
   } catch (err) {
     console.error('CREATE ITEM ERROR:', err);
     res.status(500).json({ error: 'Failed to create item', details: err.message });
@@ -199,14 +203,20 @@ app.put('/items/:id', [auth, adminOnly], async (req, res) => {
     last_renewal_date: item.last_renewal_date 
       ? new Date(item.last_renewal_date).toISOString().split('T')[0] 
       : new Date().toISOString().split('T')[0],
-    next_due_date: item.next_due_date,  // ← Use user-provided date directly
+    next_due_date: item.next_due_date,
     reminder_type: item.reminder_type || 'calibration'
   };
 
   try {
-    const [result] = await db.query('UPDATE items SET ? WHERE id = ?', [updatedItem, id]);
-    if (result.affectedRows === 0) return res.status(404).json({ error: 'Item not found' });
-    
+    const keys = Object.keys(updatedItem);
+    const values = Object.values(updatedItem);
+    const setClause = keys.map((k, i) => `${k} = $${i+1}`).join(', ');
+    const queryText = `UPDATE items SET ${setClause} WHERE id = $${keys.length + 1} RETURNING id`;
+
+    const result = await db.query(queryText, [...values, id]);
+
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Item not found' });
+
     console.log('✅ Updated item ID:', id);
     res.json({ msg: 'Item updated successfully!', id });
   } catch (err) {
@@ -219,9 +229,11 @@ app.put('/items/:id', [auth, adminOnly], async (req, res) => {
 app.delete('/items/:id', [auth, adminOnly], async (req, res) => {
   const id = parseInt(req.params.id);
   try {
-    await db.query('DELETE FROM item_reminders WHERE item_id = ?', [id]);
-    const [result] = await db.query('DELETE FROM items WHERE id = ?', [id]);
-    if (result.affectedRows === 0) return res.status(404).json({ error: 'Item not found' });
+    await db.query('DELETE FROM item_reminders WHERE item_id = $1', [id]);
+    const result = await db.query('DELETE FROM items WHERE id = $1', [id]);
+
+    if (result.rowCount === 0) return res.status(404).json({ error: 'Item not found' });
+
     console.log('✅ Deleted item ID:', id);
     res.json({ msg: 'Item deleted successfully' });
   } catch (err) {
@@ -234,13 +246,13 @@ app.delete('/items/:id', [auth, adminOnly], async (req, res) => {
 app.post('/send-now/:id', [auth, adminOnly], async (req, res) => {
   const id = parseInt(req.params.id);
   try {
-    const [rows] = await db.query(`
+    const result = await db.query(`
       SELECT id, item_name, type, serial, pic_email, next_due_date, reminder_type
-      FROM items WHERE id = ?
+      FROM items WHERE id = $1
     `, [id]);
 
-    if (rows.length === 0) return res.status(404).json({ error: 'Item not found' });
-    const item = rows[0];
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Item not found' });
+    const item = result.rows[0];
 
     const emails = (item.pic_email || '').split(',').map(e => e.trim()).filter(Boolean);
     if (emails.length === 0) return res.status(400).json({ error: 'No valid emails found' });
@@ -281,18 +293,18 @@ Thank you!
 app.get('/item-reminders/:itemId', auth, async (req, res) => {
   const itemId = parseInt(req.params.itemId);
   try {
-    const [rows] = await db.query(
-      'SELECT * FROM item_reminders WHERE item_id = ? ORDER BY remind_date, remind_time',
+    const result = await db.query(
+      'SELECT * FROM item_reminders WHERE item_id = $1 ORDER BY remind_date, remind_time',
       [itemId]
     );
-    res.json(rows);
+    res.json(result.rows);
   } catch (err) {
     console.error('GET REMINDERS ERROR:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-// === SAVE REMINDERS (FIXED DATE HANDLING) ===
+// === SAVE REMINDERS ===
 app.post('/save-reminders/:itemId', [auth, adminOnly], async (req, res) => {
   const itemId = parseInt(req.params.itemId);
   const { reminders } = req.body;
@@ -302,32 +314,29 @@ app.post('/save-reminders/:itemId', [auth, adminOnly], async (req, res) => {
   }
 
   try {
-    await db.query('DELETE FROM item_reminders WHERE item_id = ?', [itemId]);
+    await db.query('DELETE FROM item_reminders WHERE item_id = $1', [itemId]);
 
     let savedCount = 0;
 
     for (const rem of reminders) {
       if (rem.date && rem.time) {
-        // Extract ONLY YYYY-MM-DD
         let cleanDate = rem.date;
         if (typeof cleanDate === 'string' && cleanDate.includes('T')) {
           cleanDate = cleanDate.split('T')[0];
         }
 
-        // Validate format
         if (!/^\d{4}-\d{2}-\d{2}$/.test(cleanDate)) {
           console.warn(`Invalid date skipped: ${rem.date}`);
           continue;
         }
 
-        // Validate time format (HH:MM)
         if (!/^\d{2}:\d{2}$/.test(rem.time)) {
           console.warn(`Invalid time skipped: ${rem.time}`);
           continue;
         }
 
         await db.query(
-          'INSERT INTO item_reminders (item_id, remind_date, remind_time, email_sent) VALUES (?, ?, ?, FALSE)',
+          'INSERT INTO item_reminders (item_id, remind_date, remind_time, email_sent) VALUES ($1, $2, $3, FALSE)',
           [itemId, cleanDate, rem.time]
         );
         savedCount++;
@@ -371,7 +380,9 @@ app.post('/upload-excel', [auth, adminOnly], upload.single('file'), async (req, 
         reminder_type: row['Reminder Type'] || 'calibration'
       };
 
-      await db.query('INSERT INTO items SET ?', item);
+      await db.query('INSERT INTO items (item_name, type, subtype, category, serial, firmware, estimating_costing, for_by, pic, pic_contact, pic_email, last_renewal_date, next_due_date, reminder_type) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)', 
+        [item.item_name, item.type, item.subtype, item.category, item.serial, item.firmware, item.estimating_costing, item.for_by, item.pic, item.pic_contact, item.pic_email, item.last_renewal_date, item.next_due_date, item.reminder_type]);
+
       inserted++;
     }
 
@@ -412,11 +423,11 @@ const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: {
     user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS  // Must be App Password if 2FA enabled
+    pass: process.env.EMAIL_PASS
   }
 });
 
-// Verify email config on startup
+// Verify email on startup
 transporter.verify((error, success) => {
   if (error) {
     console.error('❌ EMAIL SETUP FAILED:', error);
@@ -425,7 +436,7 @@ transporter.verify((error, success) => {
   }
 });
 
-// === CRON JOB - Every minute (Malaysia Time) ===
+// === CRON JOB ===
 cron.schedule('* * * * *', async () => {
   const now = new Date();
   const malaysiaNow = new Date(now.toLocaleString('en-US', { timeZone: 'Asia/Kuala_Lumpur' }));
@@ -433,19 +444,19 @@ cron.schedule('* * * * *', async () => {
   const currentTime = malaysiaNow.toTimeString().slice(0, 5);
 
   try {
-    const [rows] = await db.query(`
+    const result = await db.query(`
       SELECT ir.*, i.item_name, i.serial, i.type, i.pic_email, i.next_due_date,
              COALESCE(i.reminder_type, 'calibration') AS reminder_type
       FROM item_reminders ir
       JOIN items i ON ir.item_id = i.id
-      WHERE ir.remind_date = ? 
-        AND ir.remind_time = ? 
+      WHERE ir.remind_date = $1 
+        AND ir.remind_time = $2 
         AND ir.email_sent = FALSE 
         AND i.pic_email IS NOT NULL 
         AND i.pic_email != ''
     `, [today, currentTime]);
 
-    for (const row of rows) {
+    for (const row of result.rows) {
       try {
         const emails = row.pic_email.split(',').map(e => e.trim()).filter(Boolean);
         if (emails.length === 0) continue;
@@ -474,7 +485,7 @@ Thank you!
           html: message.replace(/\n/g, '<br>')
         });
 
-        await db.query('UPDATE item_reminders SET email_sent = TRUE WHERE id = ?', [row.id]);
+        await db.query('UPDATE item_reminders SET email_sent = TRUE WHERE id = $1', [row.id]);
         console.log(`✅ CRON: Reminder sent for ${row.item_name} → ${emails.length} emails`);
       } catch (emailErr) {
         console.error(`Email send failed for item ${row.item_name}:`, emailErr);
@@ -485,7 +496,7 @@ Thank you!
   }
 }, { timezone: "Asia/Kuala_Lumpur" });
 
-app.listen(5000, () => {
-  console.log('🚀 Backend running on http://localhost:5000');
-  console.log('📧 Multiple reminder system ready (Malaysia Time)');
+app.listen(process.env.PORT || 5000, () => {
+  console.log('🚀 Backend running on port', process.env.PORT || 5000);
+  console.log('📧 Aziman Reminder System ready');
 });
